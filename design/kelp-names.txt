@@ -1,0 +1,13 @@
+Creating a naming system for a data storage system inspired by the concept of kelp offers a unique opportunity to use terms related to its biology and ecology, arranged from the smallest components to the largest. Here's a suggested hierarchy that you could consider:
+
+    Cell - Representing the smallest unit of data, akin to a byte or a bit. this would be 4kB blocks written to disk across multiple disks.
+
+    Stipe - a collection of cells that are written to disk in a single operation from the same RS encoding group.  This would be a collection of cells that are written to disk in a single operation from the same RS encoding group.
+    Blade - A contiguous collection of stipes in a single address block.  addresses are 64b, and the blade is from the top 32b.
+    
+    Frond - This could represent a collection of blades, similar to a file in a storage system.  This is the appended tar-like layer made on top of the blades.
+    Holdfast - Representing the base or root directory that anchors and organizes all higher levels, like the root in a filesystem.
+    Canopy - This could represent the top level or the user interface that oversees and accesses the entire data forest.
+    Forest - Representing the entire storage ecosystem, encompassing all stipes and their subordinate structures.
+
+This naming system mirrors the biological structure of kelp, from the microscopic level (cells) to the ecological scale (forest), and could provide an intuitive way to visualize and manage data storage systems.

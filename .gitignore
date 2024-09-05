@@ -1,0 +1,9 @@
+venv/
+benchavx2gf
+benchspread
+rs
+test-rs
+*.o
+*.so
+*.a
+*.pyc

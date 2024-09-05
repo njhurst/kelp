@@ -1,0 +1,5 @@
+blake3
+zstandard
+numpy
+cbor2
+psutil
