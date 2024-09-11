@@ -3,3 +3,4 @@ zstandard
 numpy
 cbor2
 psutil
+scipy

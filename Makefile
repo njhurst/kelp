@@ -5,6 +5,7 @@ ALL:
 	gcc -o benchavx2gf -g benchavx2gf.c rs_avx2.c rs.c -mavx2 -O3
 	gcc -o test-rs -g rs.c rs_avx2.c test-rs.c -O3 -mavx2
 
+	g++ -o test-blockaio -O3 -mavx2 test-blockaio.cpp -laio blockaio.cpp -lgtest -lgtest_main -pthread -laio
 venv:
 	python -m venv venv
 	. venv/bin/activate && pip install -r requirements.txt

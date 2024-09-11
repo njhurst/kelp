@@ -284,6 +284,11 @@ int submit_write(io_context_t io_ctx, int fd, int start_page, int num_pages) {
     return 0;
 }
 
+/** Write blocks from buffer
+ * 
+ * Given a buffer and an offset into the logical volume, read and update the blocks
+ */
+
 int check_completed(io_context_t io_ctx) {
     struct io_event events[MAX_EVENTS];
     struct timespec timeout = {0, 0};  // Non-blocking
