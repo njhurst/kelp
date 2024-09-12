@@ -85,16 +85,16 @@ def extract_tagged_references(obj, weak=False):
     return references, weak_references
 
 
+
 class BlobStorage:
     HEADER_SIZE = 4096  # 4KB header
 
     def __init__(self, filename: str, create: bool = False):
         self.filename = filename
-        self.file = None
+        self.fd = None
         self.file_size = 0
-        self.file_pos = 0
         
-        if create and not os.path.exists(self.filename):
+        if create:
             self._create_new_volume()
         else:
             self._open_existing_volume()
@@ -103,57 +103,171 @@ class BlobStorage:
         if os.path.exists(self.filename):
             raise FileExistsError(f"File {self.filename} already exists")
         
-        self.file = open(self.filename, "wb+")
-        self.file.write(b'\0' * self.HEADER_SIZE)
+        self.fd = os.open(self.filename, os.O_RDWR | os.O_CREAT)
+        os.write(self.fd, b'\0' * self.HEADER_SIZE)
         self.file_size = self.HEADER_SIZE
-        self.file_pos = self.HEADER_SIZE
+
+    def pread(self, size: int, offset: int) -> bytes:
+        return os.pread(self.fd, size, offset)
+
+    def pwrite(self, data: bytes, offset: int):
+        os.pwrite(self.fd, data, offset)
+        self.file_size = max(self.file_size, offset + len(data))
 
     def _open_existing_volume(self):
         if not os.path.exists(self.filename):
             raise FileNotFoundError(f"File {self.filename} not found")
         
-        self.file = open(self.filename, "rb+")
+        self.fd = os.open(self.filename, os.O_RDWR)
         self.file_size = os.path.getsize(self.filename)
 
     def write_blob(self, data: bytes, offset: int) -> int:
-        if self.file_pos != offset:
-            self.file.seek(offset)
-        self.file.write(data)
-        self.file_pos = offset + len(data)
-        self.file_size = max(self.file_size, self.file_pos)
+        os.pwrite(self.fd, data, offset)
+        self.file_size = max(self.file_size, offset + len(data))
         return offset
 
     def read_blob(self, offset: int, size: int) -> bytes:
-        if self.file_pos != offset:
-            self.file.seek(offset)
-        self.file_pos = offset + size
-        return self.file.read(size)
+        return os.pread(self.fd, size, offset)
 
     def scan_for_pattern(self, pattern: bytes):
-        """read the whole storage and return a list of positions of pattern (e.g. MAGIC).  Use stringzilla for speed."""
-        self.file.seek(0)
-        tail = b"" # the last len(pattern) bytes of the previous read
-        base = 0
-        tail_length = len(pattern)
-        while True:
-            data = self.file.read(1024*1024*16)  # 16MB chunks
-            start = 0
-            if not data:
+        """Read the whole storage and yield positions of pattern (e.g. MAGIC)."""
+        chunk_size = 16 * 1024 * 1024  # 16MB chunks
+        pattern_length = len(pattern)
+        offset = 0
+        
+        while offset < self.file_size:
+            chunk = os.pread(self.fd, chunk_size, offset)
+            if not chunk or len(chunk) < pattern_length:
                 break
-            data = tail + data
+            
+            start = 0
             while True:
-                idx = data.find(pattern, start)
+                idx = chunk.find(pattern, start)
                 if idx == -1:
                     break
-                yield base + idx
-                start = idx + tail_length
-            tail = data[-tail_length:]
-            base += len(data) - tail_length
-        
+                yield offset + idx
+                start = idx + 1
+            
+            offset += len(chunk) - pattern_length + 1
 
     def close(self):
-        if self.file:
-            self.file.close()
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+class BlobLocks:
+    """ 
+    A simple lock manager for the BlobVolume
+
+    The lock manager is a list of locks, each lock is a tuple of (lock_id, lock_type, lock_owner, lock_count, start_offset, end_offset)
+
+    lock_id: a unique identifier for the lock
+    lock_type: 0 for shared, 1 for exclusive, 2 for watch locks
+    lock_owner: the owner of the lock
+    lock_count: the number of times the lock has been acquired
+    start_offset: the start of the locked range
+    end_offset: the end of the locked range
+
+    when a user wishes to read data they acquire a shared lock, when they wish to write data they acquire an exclusive lock, when they wish to watch for changes they acquire a watch lock.
+
+    when a user acquires a lock they are given a lock_id, they must provide this lock_id when releasing the lock.
+
+    It might be worth storing in a more efficient data structure, but for now we'll just use a list.
+    """
+
+    def __init__(self):
+        self.locks = []
+        self.lock_id = 0
+        self.lock_lock = threading.Lock()
+    
+    def acquire_lock(self, lock_type: int, lock_owner: int, start_offset: int, end_offset: int) -> int:
+        """ First check if the lock is already held, if not acquire the lock.
+            Use the lock_lock, check for overlapping locks, and then add the lock if there are no overlaps.
+            otherwise raise an exception.
+        """
+        with self.lock_lock:
+            if lock_type == 1:
+                # exclusive lock
+                for lock in self.locks:
+                    if lock[2] == lock_owner and lock[4] <= start_offset and lock[5] >= end_offset:
+                        raise ValueError("Lock already held")
+            elif lock_type == 0:
+                # shared lock
+                for lock in self.locks:
+                    if lock[2] == lock_owner and lock[1] == 1 and lock[4] <= start_offset and lock[5] >= end_offset:
+                        raise ValueError("Exclusive lock already held")
+            else:
+                # watch lock - add to the list of locks
+                pass
+            
+            lock_id = self.lock_id
+            self.lock_id += 1
+            self.locks.append((lock_id, lock_type, lock_owner, 1, start_offset, end_offset))
+            return lock_id
+    
+    def release_lock(self, lock_id: int):
+        for idx, lock in enumerate(self.locks):
+            if lock[0] == lock_id:
+                if lock[3] == 1:
+                    del self.locks[idx]
+                else:
+                    self.locks[idx] = (lock[0], lock[1], lock[2], lock[3] - 1, lock[4], lock[5])
+                return
+        raise ValueError("Lock not found")
+
+    def check_read_range(self, lock_owner: int, start_offset: int, end_offset: int):
+        for lock in self.locks:
+            if lock[2] == lock_owner and lock[1] == 1 and lock[4] <= start_offset and lock[5] >= end_offset:
+                return False
+        return True
+    
+    def check_write_range(self, lock_owner: int, start_offset: int, end_offset: int):
+        for lock in self.locks:
+            if lock[2] == lock_owner and lock[4] <= start_offset and lock[5] >= end_offset:
+                return False
+        return True
+    
+    def release_all_locks(self, lock_owner: int):
+        self.locks = [lock for lock in self.locks if lock[2] != lock_owner]
+    
+    def get_locks(self, lock_owner: int):
+        return [lock for lock in self.locks if lock[2] == lock_owner]
+
+    def get_lock(self, lock_id: int):
+        for lock in self.locks:
+            if lock[0] == lock_id:
+                return lock
+        return None
+    
+    def has_lock(self, lock_id: int):
+        return self.get_lock(lock_id) is not None
+
+    def has_locks(self, lock_owner: int):
+        return len(self.get_locks(lock_owner)) > 0
+    
+    def has_exclusive_locks(self, lock_owner: int):
+        return any(lock[1] == 1 for lock in self.get_locks(lock_owner))
+
+    def has_shared_locks(self, lock_owner: int):
+        return any(lock[1] == 0 for lock in self.get_locks(lock_owner))
+    
+    def has_watch_locks(self, lock_owner: int):
+        return any(lock[1] == 2 for lock in self.get_locks(lock_owner))
+    
+    def has_locks_in_range(self, lock_owner: int, start_offset: int, end_offset: int):
+        return any(lock[4] <= start_offset and lock[5] >= end_offset for lock in self.get_locks(lock_owner))
+    
+    def has_exclusive_locks_in_range(self, lock_owner: int, start_offset: int, end_offset: int):
+        return any(lock[1] == 1 and lock[4] <= start_offset and lock[5] >= end_offset for lock in self.get_locks(lock_owner))
+    
+    def has_shared_locks_in_range(self, lock_owner: int, start_offset: int, end_offset: int):
+        return any(lock[1] == 0 and lock[4] <= start_offset and lock[5] >= end_offset for lock in self.get_locks(lock_owner))
+    
+    def has_watch_locks_in_range(self, lock_owner: int, start_offset: int, end_offset: int):
+        return any(lock[1] == 2 and lock[4] <= start_offset and lock[5] >= end_offset for lock in self.get_locks(lock_owner))
+
+    def has_locks_in_range_exclusive(self, lock_owner: int, start_offset: int, end_offset: int):
+        return any(lock[4] <= start_offset and lock[5] >= end_offset for lock in self.get_locks(lock_owner) if lock[1] == 1)
 
 class BlobVolume:
     INDEX_ENTRY_DTYPE = np.dtype([
@@ -188,10 +302,8 @@ class BlobVolume:
             self._load_index()
     
     def _create_new_index(self):
-        self.storage.file.seek(0)
-        self.storage.file.write(b'\0' * self.storage.HEADER_SIZE)
+        self.storage.pwrite(b'\0' * self.storage.HEADER_SIZE, 0)
         self.tail_pos = self.storage.HEADER_SIZE
-        self.file_pos = -1
 
         # write the special offsets - primary, secondary and root; all growable
         data_length = len(self.generate_index_blob())
@@ -220,8 +332,7 @@ class BlobVolume:
         self.save_index()
 
     def _load_index(self):
-        self.storage.file.seek(0)
-        index_data = self.storage.file.read(self.storage.HEADER_SIZE)
+        index_data = self.storage.pread(self.storage.HEADER_SIZE, 0)
 
         # Parse the header
         bare_header_size = struct.calcsize(self.HEADER_STRING)
@@ -233,15 +344,13 @@ class BlobVolume:
         self.magic, self.version, self.volume_prefix, primary_index, secondary_index, root_index, self.tail_pos = header
 
         # Parse the index entries
-        self.storage.file.seek(primary_index)
 
         # first 3 entries are always there
-        index_data = self.storage.file.read(3 * self.INDEX_ENTRY_DTYPE.itemsize)
+        index_data = self.storage.pread(3 * self.INDEX_ENTRY_DTYPE.itemsize, primary_index)
         self.entries = np.frombuffer(index_data, dtype=self.INDEX_ENTRY_DTYPE).copy()
 
         # read all of the entries
-        self.storage.file.seek(self.entries[0]['offset'])
-        index_data = self.storage.file.read(self.entries[0]['size'])
+        index_data = self.storage.pread(self.entries[0]['size'], self.entries[0]['offset'])
         self.entries = np.frombuffer(index_data, dtype=self.INDEX_ENTRY_DTYPE).copy()
         self.entries_size = len(self.entries)
 
@@ -250,7 +359,6 @@ class BlobVolume:
         # growable = np.where(self.entries['flags'] & self.FLAGS['growable'])
         # allocated = self.entries['offset'][disk_order+1] - self.entries['offset'][disk_order]
         # self.growable = dict(zip(growable, allocated))
-        self.file_pos = -1
 
     def add_blob_to_index(self, size: int, flags: int) -> int:
         offset = self.tail_pos
@@ -295,10 +403,8 @@ class BlobVolume:
         header += checksum
         remaining = self.storage.HEADER_SIZE - len(header)
 
-        self.storage.file.seek(0)
-        self.storage.file.write(header)
-        self.storage.file.write(b'\0' * remaining)
-        self.file_pos = -1
+        self.storage.pwrite(header, 0)
+        self.storage.pwrite(b'\0' * remaining, len(header))
     
     def get_sort_order(self):
         return np.argsort(self.entries[:self.entries_size]['offset'])
