@@ -7,3 +7,5 @@ test-rs
 *.so
 *.a
 *.pyc
+build/
+external/

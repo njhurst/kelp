@@ -288,7 +288,6 @@ class BlobVolume:
         'magiced': 0x10,
         'deleted': 0x80,
     }
-    HEADER_STRING = "32sIIQQQQ"
 
     def __init__(self, filename: str, create: bool = False):
         self.storage = BlobStorage(filename, create)
@@ -335,12 +334,12 @@ class BlobVolume:
         index_data = self.storage.pread(self.storage.HEADER_SIZE, 0)
 
         # Parse the header
-        bare_header_size = struct.calcsize(self.HEADER_STRING)
+        bare_header_size = struct.calcsize("<32sIIQQQQ")
         header_data = index_data[:bare_header_size]
         digest = blake3.blake3(header_data).digest()
         stored_digest = index_data[bare_header_size:bare_header_size+32]
         assert(digest == stored_digest)
-        header = struct.unpack(self.HEADER_STRING, header_data)
+        header = struct.unpack("<32sIIQQQQ", header_data)
         self.magic, self.version, self.volume_prefix, primary_index, secondary_index, root_index, self.tail_pos = header
 
         # Parse the index entries
@@ -398,7 +397,7 @@ class BlobVolume:
         self.storage.write_blob(index_blob_data, self.entries[1]['offset'])
         
         # construct the header
-        header = struct.pack(self.HEADER_STRING, self.magic, self.version, self.volume_prefix, self.entries[0]['offset'], self.entries[1]['offset'], self.entries[2]['offset'], self.tail_pos)
+        header = struct.pack("<32sIIQQQQ", self.magic, self.version, self.volume_prefix, self.entries[0]['offset'], self.entries[1]['offset'], self.entries[2]['offset'], self.tail_pos)
         checksum = blake3.blake3(header).digest()
         header += checksum
         remaining = self.storage.HEADER_SIZE - len(header)
